@@ -1,0 +1,4 @@
+nano install_sangu_java_ide.sh
+# ჩასვი მთელი ტექსტი
+chmod +x install_sangu_java_ide.sh
+sudo ./install_sangu_java_ide.sh
