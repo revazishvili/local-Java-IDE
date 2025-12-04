@@ -1,0 +1,1011 @@
+#!/usr/bin/env bash
+set -e
+
+echo "=== SANGU Java IDE ავტომატური ინსტალერი (Ubuntu 24.04) ==="
+
+if [ "$(id -u)" -ne 0 ]; then
+  echo "გთხოვ, გაუშვი სკრიპტი root-ით: sudo $0"
+  exit 1
+fi
+
+# ---------- 1. Input ----------
+read -rp "შეიყვანე დომენი ან IP (server_name nginx-სთვის, напр. 172.16.50.91): " SERVER_NAME
+if [ -z "$SERVER_NAME" ]; then
+  echo "server_name არ შეიძლება იყოს ცარიელი."
+  exit 1
+fi
+
+APP_USER="javaide"
+APP_DIR="/opt/java-ide"
+APP_APP_DIR="$APP_DIR/app"
+APP_FRONTEND_DIR="$APP_DIR/frontend"
+APP_SESSIONS_DIR="$APP_DIR/sessions"
+NODE_PORT=4000
+
+echo "server_name = $SERVER_NAME"
+echo "აპლიკაციის იუზერი = $APP_USER"
+echo "დაფოლტ პორტი NodeJS = $NODE_PORT"
+echo
+
+# ---------- 2. Packages ----------
+echo ">>> 2. საჭირო პაკეტების ინსტალაცია (curl, git, nginx, Node, npm, pm2, Java)..."
+
+apt-get update -y
+
+# Java
+apt-get install -y openjdk-17-jdk-headless
+
+# utilities
+apt-get install -y curl git build-essential
+
+# Node.js 20.x (NodeSource)
+if ! command -v node >/dev/null 2>&1; then
+  echo "Node.js არ არის დაყენებული, ვაყენებ NodeSource 20.x-ს..."
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+  apt-get install -y nodejs
+fi
+
+# pm2
+npm install -g pm2
+
+# nginx
+apt-get install -y nginx
+
+echo "პაკეტები დაყენებულია."
+echo
+
+# ---------- 3. System user + directories ----------
+echo ">>> 3. სისტემური იუზერი და დირექტორიების შექმნა..."
+
+if ! id "$APP_USER" >/dev/null 2>&1; then
+  adduser --system --group --home "$APP_DIR" "$APP_USER"
+fi
+
+mkdir -p "$APP_APP_DIR" "$APP_FRONTEND_DIR" "$APP_SESSIONS_DIR"
+chown -R "$APP_USER":"$APP_USER" "$APP_DIR"
+
+echo "დირექტორიები მზადაა: $APP_DIR"
+echo
+
+# ---------- 4. server.js ----------
+echo ">>> 4. NodeJS server.js ჩაწერა..."
+
+cat > "$APP_APP_DIR/server.js" << 'EOF'
+const express = require("express");
+const cors = require("cors");
+const fs = require("fs");
+const path = require("path");
+const { exec } = require("child_process");
+const bodyParser = require("body-parser");
+const { v4: uuidv4 } = require("uuid");
+
+const app = express();
+const PORT = 4000;
+
+const BASE_DIR = "/opt/java-ide/sessions";
+const FRONTEND_DIR = "/opt/java-ide/frontend";
+
+app.use(cors());
+app.use(bodyParser.json({ limit: "50mb" }));
+
+// FRONTEND static files (index.html, style.css, script.js)
+app.use(express.static(FRONTEND_DIR));
+
+// Health
+app.get("/health", (req, res) => {
+  res.json({ status: "ok", port: PORT });
+});
+
+// 1) SESSION CREATE
+app.post("/session/create", (req, res) => {
+  const sessionId = uuidv4();
+  const dir = path.join(BASE_DIR, sessionId);
+  fs.mkdirSync(dir, { recursive: true });
+  console.log(`Session created: ${sessionId}`);
+  res.json({ sessionId });
+});
+
+// 2) SAVE FILE
+app.post("/file/save", (req, res) => {
+  const { sessionId, fileName, content } = req.body;
+  if (!sessionId || !fileName) {
+    return res.status(400).json({ error: "Missing sessionId or fileName" });
+  }
+  const dir = path.join(BASE_DIR, sessionId);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, fileName), content, "utf8");
+  res.json({ status: "saved" });
+});
+
+// 3) LOAD PROJECT
+app.post("/project/load", (req, res) => {
+  const { sessionId } = req.body;
+  if (!sessionId) return res.status(400).json({ error: "Missing sessionId" });
+
+  const dir = path.join(BASE_DIR, sessionId);
+  if (!fs.existsSync(dir)) return res.json({ files: [] });
+
+  const files = fs.readdirSync(dir).map((f) => ({
+    name: f,
+    content: fs.readFileSync(path.join(dir, f), "utf8")
+  }));
+  res.json({ files });
+});
+
+// 4) SESSION CLOSE
+app.post("/session/close", (req, res) => {
+  const { sessionId } = req.body;
+  if (!sessionId) return res.json({ status: "no-session" });
+
+  const dir = path.join(BASE_DIR, sessionId);
+  if (fs.existsSync(dir)) {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+  console.log(`Session removed: ${sessionId}`);
+  res.json({ status: "deleted" });
+});
+
+// 5) DOWNLOAD FILE
+app.get("/file/download", (req, res) => {
+  const { sessionId, fileName } = req.query;
+  if (!sessionId || !fileName) {
+    return res.status(400).json({ error: "Missing sessionId or fileName" });
+  }
+  const filePath = path.join(BASE_DIR, sessionId, fileName);
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: "File not found" });
+  }
+  res.download(filePath);
+});
+
+// 6) DOWNLOAD PROJECT (JSON)
+app.get("/project/download", (req, res) => {
+  const { sessionId } = req.query;
+  if (!sessionId) return res.status(400).json({ error: "Missing sessionId" });
+
+  const dir = path.join(BASE_DIR, sessionId);
+  if (!fs.existsSync(dir)) {
+    return res.status(404).json({ error: "Project not found" });
+  }
+
+  const project = fs.readdirSync(dir).map((f) => ({
+    name: f,
+    content: fs.readFileSync(path.join(dir, f), "utf8")
+  }));
+
+  res.json({ project });
+});
+
+// 7) COMPILE + RUN JAVA
+app.post("/java/run", (req, res) => {
+  const { sessionId, mainClass } = req.body;
+  if (!sessionId || !mainClass) {
+    return res.status(400).json({ error: "Missing sessionId or mainClass" });
+  }
+
+  const dir = path.join(BASE_DIR, sessionId);
+
+  exec("javac *.java", { cwd: dir }, (compileErr, compileOut, compileErrOut) => {
+    if (compileErr) {
+      return res.json({
+        error: true,
+        stage: "compile",
+        message: compileErrOut
+      });
+    }
+
+    exec(`java ${mainClass}`, { cwd: dir }, (runErr, runOut, runErrOut) => {
+      if (runErr) {
+        return res.json({
+          error: true,
+          stage: "run",
+          message: runErrOut
+        });
+      }
+
+      res.json({
+        error: false,
+        output: runOut
+      });
+    });
+  });
+});
+
+app.listen(PORT, () => {
+  console.log(`SANGU Java IDE (frontend + API) running on port ${PORT}`);
+});
+EOF
+
+chown "$APP_USER":"$APP_USER" "$APP_APP_DIR/server.js"
+
+# ---------- 5. Frontend files ----------
+echo ">>> 5. Frontend ფაილების ჩაწერა (index.html, style.css, script.js)..."
+
+# index.html
+cat > "$APP_FRONTEND_DIR/index.html" << 'EOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>SANGU Java IDE</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <link rel="stylesheet" href="style.css" />
+  <script src="https://unpkg.com/monaco-editor@0.45.0/min/vs/loader.js"></script>
+</head>
+<body>
+  <div class="app">
+    <header class="top-bar">
+      <div class="brand">
+        <span class="logo-dot"></span>
+        <span class="brand-title">SANGU Java IDE</span>
+        <span class="brand-copyright">
+          © 2025 SANGU IT Department — Kakhaber Revazishvili
+        </span>
+        <span id="sessionInfo" class="session-info"></span>
+      </div>
+      <div class="toolbar">
+        <button id="newFileBtn">New File</button>
+        <button id="saveFileBtn">Save File</button>
+        <button id="saveAllBtn">Save All</button>
+        <button id="runBtn" class="primary">Run ▶</button>
+        <button id="downloadFileBtn">Download File</button>
+        <button id="downloadProjectBtn">Download Project</button>
+
+        <label class="upload-label">
+          Upload File
+          <input type="file" id="uploadFileInput" style="display:none" />
+        </label>
+
+        <button id="exitBtn" class="danger">Exit & Clear</button>
+      </div>
+    </header>
+
+    <main class="main-layout">
+      <aside class="sidebar">
+        <div class="sidebar-header">
+          <span>Project Files</span>
+        </div>
+        <ul id="fileList" class="file-list"></ul>
+      </aside>
+
+      <section class="editor-panel">
+        <div id="editor" class="editor"></div>
+        <div class="console-panel">
+          <div class="console-header">
+            <span>Console</span>
+            <span id="status" class="status"></span>
+          </div>
+          <pre id="output" class="console-output"></pre>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="script.js"></script>
+</body>
+</html>
+EOF
+
+# style.css
+cat > "$APP_FRONTEND_DIR/style.css" << 'EOF'
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background: radial-gradient(circle at top, #1f2937 0, #020617 55%, #000 100%);
+  color: #e5e7eb;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI",
+    sans-serif;
+  height: 100vh;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+/* Top bar */
+
+.top-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0.6rem 1rem;
+  background: rgba(15, 23, 42, 0.95);
+  border-bottom: 1px solid rgba(148, 163, 184, 0.25);
+  backdrop-filter: blur(10px);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.logo-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 999px;
+  background: radial-gradient(circle, #38bdf8, #1d4ed8);
+  box-shadow: 0 0 12px rgba(56, 189, 248, 0.9);
+}
+
+.brand-title {
+  font-weight: 600;
+  color: #e5e7eb;
+  font-size: 1rem;
+}
+
+.brand-copyright {
+  margin-left: 1rem;
+  font-size: 0.75rem;
+  color: #9ca3af;
+  opacity: 0.85;
+  white-space: nowrap;
+}
+
+.session-info {
+  margin-left: 0.75rem;
+  font-size: 0.75rem;
+  color: #9ca3af;
+  opacity: 0.9;
+}
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  align-items: center;
+}
+
+.toolbar button,
+.upload-label {
+  border: 1px solid rgba(148, 163, 184, 0.4);
+  background: rgba(15, 23, 42, 0.9);
+  color: #e5e7eb;
+  border-radius: 999px;
+  padding: 0.3rem 0.8rem;
+  font-size: 0.8rem;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  transition: background 0.15s ease, border-color 0.15s ease,
+    transform 0.05s ease;
+}
+
+.toolbar button:hover,
+.upload-label:hover {
+  background: rgba(30, 64, 175, 0.9);
+  border-color: rgba(129, 140, 248, 0.8);
+  transform: translateY(-1px);
+}
+
+.toolbar button.primary {
+  background: linear-gradient(to right, #2563eb, #38bdf8);
+  border-color: transparent;
+  color: white;
+}
+
+.toolbar button.primary:hover {
+  filter: brightness(1.05);
+}
+
+.toolbar button.danger {
+  background: rgba(185, 28, 28, 0.9);
+  border-color: rgba(248, 113, 113, 0.7);
+}
+
+.toolbar button.danger:hover {
+  filter: brightness(1.05);
+}
+
+.upload-label {
+  position: relative;
+}
+
+/* Layout */
+
+.main-layout {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  height: calc(100vh - 52px);
+}
+
+/* Sidebar */
+
+.sidebar {
+  border-right: 1px solid rgba(148, 163, 184, 0.25);
+  background: radial-gradient(circle at top left, #020617 0, #020617 35%, #020617 100%);
+  backdrop-filter: blur(8px);
+  display: flex;
+  flex-direction: column;
+}
+
+.sidebar-header {
+  padding: 0.65rem 0.75rem;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: #9ca3af;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.25);
+}
+
+.file-list {
+  list-style: none;
+  margin: 0;
+  padding: 0.5rem 0.25rem;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.file-list li {
+  padding: 0.3rem 0.7rem;
+  font-size: 0.8rem;
+  color: #e5e7eb;
+  border-radius: 0.45rem;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.file-list li::before {
+  content: "📄";
+  font-size: 0.8rem;
+  opacity: 0.8;
+}
+
+.file-list li:hover {
+  background: rgba(30, 64, 175, 0.35);
+}
+
+.file-list li.active {
+  background: rgba(37, 99, 235, 0.8);
+  color: white;
+}
+
+/* Editor / Console */
+
+.editor-panel {
+  display: flex;
+  flex-direction: column;
+}
+
+.editor {
+  flex: 1;
+  min-height: 0;
+}
+
+.console-panel {
+  height: 180px;
+  border-top: 1px solid rgba(148, 163, 184, 0.25);
+  background: rgba(15, 23, 42, 0.95);
+  display: flex;
+  flex-direction: column;
+}
+
+.console-header {
+  padding: 0.4rem 0.75rem;
+  font-size: 0.8rem;
+  color: #9ca3af;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.status {
+  font-size: 0.75rem;
+  color: #a5b4fc;
+}
+
+.console-output {
+  margin: 0;
+  padding: 0.5rem 0.75rem;
+  font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco,
+    Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 0.8rem;
+  color: #e5e7eb;
+  background: transparent;
+  overflow-y: auto;
+  white-space: pre-wrap;
+}
+
+/* Responsive */
+
+@media (max-width: 900px) {
+  .main-layout {
+    grid-template-columns: 180px minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 700px) {
+  .main-layout {
+    grid-template-columns: 1fr;
+    grid-template-rows: 160px auto;
+  }
+
+  .sidebar {
+    border-right: none;
+    border-bottom: 1px solid rgba(148, 163, 184, 0.25);
+  }
+}
+EOF
+
+# script.js
+cat > "$APP_FRONTEND_DIR/script.js" << 'EOF'
+// Backend API - იგივე ჰოსტზე, იგივე პორტზე (nginx → Node 4000)
+const API_BASE = "";
+
+// State
+let editor;
+let sessionId = null;
+let files = {}; // { fileName: content }
+let activeFile = null;
+
+const SESSION_KEY = "javaIDE_sessionId";
+
+// DOM elements
+const fileListEl = document.getElementById("fileList");
+const statusEl = document.getElementById("status");
+const outputEl = document.getElementById("output");
+const sessionInfoEl = document.getElementById("sessionInfo");
+
+const newFileBtn = document.getElementById("newFileBtn");
+const saveFileBtn = document.getElementById("saveFileBtn");
+const saveAllBtn = document.getElementById("saveAllBtn");
+const runBtn = document.getElementById("runBtn");
+const exitBtn = document.getElementById("exitBtn");
+const downloadFileBtn = document.getElementById("downloadFileBtn");
+const downloadProjectBtn = document.getElementById("downloadProjectBtn");
+const uploadFileInput = document.getElementById("uploadFileInput");
+
+// -----------------------
+// INIT
+// -----------------------
+window.addEventListener("DOMContentLoaded", async () => {
+  try {
+    await initSession();
+    await loadProjectFromBackend();
+    await initMonaco();
+    attachUIHandlers();
+  } catch (e) {
+    console.error(e);
+    alert("Java IDE init error. Check console.");
+  }
+});
+
+// -----------------------
+// SESSION
+// -----------------------
+async function initSession() {
+  const stored = localStorage.getItem(SESSION_KEY);
+  if (stored) {
+    sessionId = stored;
+    sessionInfoEl.textContent = `Session: ${sessionId.slice(0, 8)}…`;
+    return;
+  }
+
+  const res = await fetch(`${API_BASE}/session/create`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({})
+  });
+  const data = await res.json();
+  sessionId = data.sessionId;
+  localStorage.setItem(SESSION_KEY, sessionId);
+  sessionInfoEl.textContent = `Session: ${sessionId.slice(0, 8)}…`;
+}
+
+// -----------------------
+// PROJECT LOAD
+// -----------------------
+async function loadProjectFromBackend() {
+  const res = await fetch(`${API_BASE}/project/load`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionId })
+  });
+  const data = await res.json();
+
+  if (data.files && data.files.length > 0) {
+    files = {};
+    data.files.forEach((f) => {
+      files[f.name] = f.content;
+    });
+  } else {
+    const mainContent = `public class Main {
+    public static void main(String[] args) {
+        System.out.println("Hello from SANGU Java IDE!");
+    }
+}
+
+// შეგიძლიათ აქვე შექმნათ სხვა კლასებიც,
+// რომლებიც Main-იდან გამოიძახებათ.
+`;
+    files["Main.java"] = mainContent;
+    await saveFileToBackend("Main.java");
+  }
+
+  const firstFile = Object.keys(files)[0];
+  setActiveFile(firstFile);
+  renderFileList();
+}
+
+// -----------------------
+// MONACO
+// -----------------------
+function initMonaco() {
+  return new Promise((resolve) => {
+    window.require.config({
+      paths: { vs: "https://unpkg.com/monaco-editor@0.45.0/min/vs" }
+    });
+
+    window.require(["vs/editor/editor.main"], () => {
+      editor = monaco.editor.create(document.getElementById("editor"), {
+        value: files[activeFile] || "",
+        language: "java",
+        theme: "vs-dark",
+        fontSize: 14,
+        automaticLayout: true,
+        minimap: { enabled: false },
+        scrollBeyondLastLine: false,
+        smoothScrolling: true,
+        quickSuggestions: {
+          other: true,
+          comments: false,
+          strings: false
+        },
+        suggestOnTriggerCharacters: [".", "("],
+        parameterHints: { enabled: true }
+      });
+
+      // Local content tracking
+      editor.getModel().onDidChangeContent(() => {
+        if (activeFile) {
+          files[activeFile] = editor.getValue();
+          markStatus("Unsaved changes…");
+        }
+      });
+
+      // JAVA SNIPPET COMPLETIONS
+      monaco.languages.registerCompletionItemProvider("java", {
+        triggerCharacters: [".", "(", " "],
+        provideCompletionItems: (model, position) => {
+          const wordInfo = model.getWordUntilPosition(position);
+          const range = {
+            startLineNumber: position.lineNumber,
+            startColumn: wordInfo.startColumn,
+            endLineNumber: position.lineNumber,
+            endColumn: wordInfo.endColumn
+          };
+
+          const suggestions = [
+            {
+              label: "psvm",
+              kind: monaco.languages.CompletionItemKind.Snippet,
+              documentation: "public static void main(String[] args) { ... }",
+              insertText:
+                "public static void main(String[] args) {\n    $0\n}",
+              insertTextRules:
+                monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+              range
+            },
+            {
+              label: "sout",
+              kind: monaco.languages.CompletionItemKind.Snippet,
+              documentation: "System.out.println(...)",
+              insertText: "System.out.println($0);",
+              insertTextRules:
+                monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+              range
+            },
+            {
+              label: "fori",
+              kind: monaco.languages.CompletionItemKind.Snippet,
+              documentation: "for (int i = 0; i < n; i++)",
+              insertText:
+                "for (int i = 0; i < ${1:n}; i++) {\n    $0\n}",
+              insertTextRules:
+                monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+              range
+            },
+            {
+              label: "class",
+              kind: monaco.languages.CompletionItemKind.Snippet,
+              documentation: "public class ClassName { ... }",
+              insertText:
+                "public class ${1:ClassName} {\n\n    $0\n\n}",
+              insertTextRules:
+                monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet,
+              range
+            }
+          ];
+
+          return { suggestions };
+        }
+      });
+
+      resolve();
+    });
+  });
+}
+
+// -----------------------
+// UI HANDLERS
+// -----------------------
+function attachUIHandlers() {
+  newFileBtn.addEventListener("click", onNewFile);
+  saveFileBtn.addEventListener("click", onSaveFile);
+  saveAllBtn.addEventListener("click", onSaveAll);
+  runBtn.addEventListener("click", onRun);
+  exitBtn.addEventListener("click", onExit);
+  downloadFileBtn.addEventListener("click", onDownloadFile);
+  downloadProjectBtn.addEventListener("click", onDownloadProject);
+  uploadFileInput.addEventListener("change", onUploadFile);
+}
+
+// -----------------------
+// FILE LIST
+// -----------------------
+function renderFileList() {
+  fileListEl.innerHTML = "";
+  Object.keys(files).forEach((name) => {
+    const li = document.createElement("li");
+    li.textContent = name;
+    if (name === activeFile) li.classList.add("active");
+    li.addEventListener("click", () => {
+      setActiveFile(name);
+    });
+    fileListEl.appendChild(li);
+  });
+}
+
+function setActiveFile(name) {
+  activeFile = name;
+  if (editor) {
+    const value = files[name] || "";
+    editor.setValue(value);
+  }
+  renderFileList();
+  clearOutput();
+}
+
+// -----------------------
+// ACTIONS
+// -----------------------
+async function onNewFile() {
+  const name = prompt("New Java file name (e.g., MyClass.java):");
+  if (!name) return;
+  if (files[name]) {
+    alert("File already exists.");
+    return;
+  }
+
+  let template = "";
+  if (name.endsWith(".java")) {
+    const className = name.replace(".java", "");
+    template = `public class ${className} {
+
+}
+`;
+  }
+
+  files[name] = template;
+  setActiveFile(name);
+  renderFileList();
+  await saveFileToBackend(name);
+  markStatus(`Created and saved ${name}`);
+}
+
+async function onSaveFile() {
+  if (!activeFile) return;
+  await saveFileToBackend(activeFile);
+  markStatus(`Saved ${activeFile}`);
+}
+
+async function onSaveAll() {
+  const names = Object.keys(files);
+  for (const name of names) {
+    await saveFileToBackend(name);
+  }
+  markStatus("All files saved.");
+}
+
+async function onRun() {
+  if (!activeFile) return;
+
+  await onSaveAll();
+
+  const mainClass = activeFile.endsWith(".java")
+    ? activeFile.replace(".java", "")
+    : activeFile;
+
+  markStatus(`Compiling & running ${mainClass}…`);
+  clearOutput();
+
+  const res = await fetch(`${API_BASE}/java/run`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionId, mainClass })
+  });
+  const data = await res.json();
+
+  if (data.error) {
+    markStatus(`Error in ${data.stage}`);
+    writeOutput(data.message || "Unknown error");
+  } else {
+    markStatus("Execution finished.");
+    writeOutput(data.output || "");
+  }
+}
+
+function onExit() {
+  if (!confirm("Exit and clear project? This cannot be undone.")) return;
+
+  fetch(`${API_BASE}/session/close`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ sessionId })
+  }).finally(() => {
+    localStorage.removeItem(SESSION_KEY);
+    window.location.reload();
+  });
+}
+
+function onDownloadFile() {
+  if (!activeFile) return;
+  const url = `${API_BASE}/file/download?sessionId=${encodeURIComponent(
+    sessionId
+  )}&fileName=${encodeURIComponent(activeFile)}`;
+  window.open(url, "_blank");
+}
+
+async function onDownloadProject() {
+  const url = `${API_BASE}/project/download?sessionId=${encodeURIComponent(
+    sessionId
+  )}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    alert("Cannot download project.");
+    return;
+  }
+  const data = await res.json();
+  const blob = new Blob([JSON.stringify(data.project, null, 2)], {
+    type: "application/json"
+  });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "java-project.json";
+  a.click();
+}
+
+function onUploadFile(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+
+  const reader = new FileReader();
+  reader.onload = async (ev) => {
+    const content = ev.target.result;
+    files[file.name] = content;
+    setActiveFile(file.name);
+    renderFileList();
+    await saveFileToBackend(file.name);
+    markStatus(`Uploaded & saved ${file.name}`);
+    uploadFileInput.value = "";
+  };
+  reader.readAsText(file);
+}
+
+// -----------------------
+// BACKEND HELPERS
+// -----------------------
+async function saveFileToBackend(name) {
+  const content = files[name] ?? "";
+  await fetch(`${API_BASE}/file/save`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      sessionId,
+      fileName: name,
+      content
+    })
+  });
+}
+
+// -----------------------
+// UI HELPERS
+// -----------------------
+function markStatus(text) {
+  if (statusEl) statusEl.textContent = text;
+}
+
+function clearOutput() {
+  if (outputEl) outputEl.textContent = "";
+}
+
+function writeOutput(text) {
+  if (outputEl) outputEl.textContent = text;
+}
+EOF
+
+chown -R "$APP_USER":"$APP_USER" "$APP_FRONTEND_DIR"
+
+echo "Frontend ფაილები ჩაწერილია."
+echo
+
+# ---------- 6. PM2 კონფიგი ----------
+echo ">>> 6. PM2 მუშაობის დაყენება (როგორც javaide იუზერი)..."
+
+su - "$APP_USER" -s /bin/bash -c "pm2 start $APP_APP_DIR/server.js --name java-ide || pm2 restart java-ide"
+su - "$APP_USER" -s /bin/bash -c "pm2 save"
+
+# pm2 startup (ავტომატურად დავგენერიროთ და ჩავრანოთ)
+STARTUP_CMD=$(su - "$APP_USER" -s /bin/bash -c "pm2 startup systemd -u $APP_USER --hp $APP_DIR" | grep 'sudo' || true)
+if [ -n "$STARTUP_CMD" ]; then
+  echo "pm2 startup ბრძანება: $STARTUP_CMD"
+  eval "$STARTUP_CMD"
+fi
+
+echo "PM2 კონფიგი მზადაა."
+echo
+
+# ---------- 7. Nginx reverse proxy ----------
+echo ">>> 7. Nginx reverse proxy კონფიგურაცია..."
+
+NGINX_SITE="/etc/nginx/sites-available/java-ide"
+
+cat > "$NGINX_SITE" << EOF
+server {
+    listen 80;
+    listen [::]:80;
+
+    server_name $SERVER_NAME;
+
+    location / {
+        proxy_pass http://127.0.0.1:$NODE_PORT;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    }
+}
+EOF
+
+ln -sf "$NGINX_SITE" /etc/nginx/sites-enabled/java-ide
+rm -f /etc/nginx/sites-enabled/default || true
+
+nginx -t
+systemctl restart nginx
+
+echo "Nginx გამართულია."
+echo
+
+# ---------- 8. UFW (არჩევით) ----------
+if command -v ufw >/dev/null 2>&1; then
+  echo ">>> 8. UFW კონფიგი (არჩევით)..."
+  read -rp "გინდა UFW-ით გახსნა 80/tcp? (y/N): " UFW_ANS
+  if [[ "$UFW_ANS" =~ ^[Yy]$ ]]; then
+    ufw allow 80/tcp || true
+    echo "პორტი 80 გახსნილია UFW-ში."
+  else
+    echo "UFW არ შევცვალე."
+  fi
+fi
+
+echo
+echo "=================== დასრულდა! ==================="
+echo "SANGU Java IDE გაშვებულია Node პორტზე $NODE_PORT (pm2 java-ide)."
+echo "Nginx ემსახურება:   http://$SERVER_NAME/"
+echo
+echo "ტესტი: გახსენი ბრაუზერში:  http://$SERVER_NAME/"
+echo "თუ რამე ვერ იმუშავებს, ნახე:"
+echo "  sudo -u $APP_USER pm2 logs java-ide"
+echo "  journalctl -u nginx.service -n 50"
